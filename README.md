@@ -1,32 +1,40 @@
-# ONNX Runtime Extension for Automatic1111's SD WebUI
+# ONNX Runtime Extension for Stable Diffusion
 
-This extension enables optimized execution of Stable Diffusion UNet model on Nividia GPU.
+This extension enables optimized execution of Stable Diffusion on Nividia RTX GPUs using [ONNX Runtime](https://onnxruntime.ai/) CUDA execution provider.
 
-For non-CUDA compatible GPU, please use [DirectML Extension for SD WebUI](https://github.com/microsoft/Stable-Diffusion-WebUI-DirectML) instead.
+You need to install the extension and generate ONNX models before using the extension. Please follow the instructions below to set everything up. 
 
-As a pre-requisite, the models need to be optimized through [Olive](https://github.com/microsoft/Olive) and added to the WebUI's model inventory, as described in the Setup
-section. This extension uses [ONNX Runtime](https://onnxruntime.ai/) CUDA execution provider to run inference against these models.
-
-Stable Diffusion versions 1.5 is supported. We are still working on 2.1, sd-turbo, SDXL 1.0 and SDXL-Turbo.
-
-## Getting Started
-
-1. Follow instructions [here](https://github.com/microsoft/Olive/tree/main/examples/stable_diffusion#prerequisitesn) to setup Olive.
-2. Convert your SD model to ONNX, optimized by Olive, as described [here](https://github.com/microsoft/Olive/tree/main/examples/stable_diffusion#conversion-to-onnx-and-latency-optimization). The following commands are for 1.5, 2.1 and sd-turbo:
-    ```
-    python stable_diffusion.py --provider cuda --optimize
-    python stable_diffusion.py --provider cuda --optimize --model_id stabilityai/stable-diffusion-2-1
-    python stable_diffusion.py --provider cuda --optimize --model_id stabilityai/sd-turbo    
-    ```
-3. The optimized Unet model will be stored under `models\optimized-cuda\[model_id]\unet` (for example `models\optimized-cuda\runwayml\stable-diffusion-v1-5\unet\`). Copy this over, renaming to match the filename of the base SD WebUI model, to the WebUI's `models\Unet-ort` folder.
-4. Go to Settings → User Interface → Quick Settings List, add sd_unet. Apply these settings, then reload the UI.
-5. Back in the main UI, select the ORT Unet model from the sd_unet dropdown menu at the top of the page, and get going.
-</ol>
+Supports Stable Diffusion 1.5, 2.1, SD-Turbo, SDXL 1.0, and SDXL-Turbo. For SDXL and SDXL Turbo, we recommend using a GPU with 12 GB or more VRAM for best performance.
 
 ## Notes
+For non-CUDA compatible GPU, please use [DirectML Extension for SD WebUI](https://github.com/microsoft/Stable-Diffusion-WebUI-DirectML) instead.
+
+LoRA and ControlNet are not supported at this time.
+
 Image dimensions need to be specified as multiples of 64.
 
-Stable Diffusion XL is not supported at this time, nor are LoRA/ControlNet.
+If you use dev branch of Automatic1111, please add the following line to webui-user.bat to use Torch of cuda 11.8:
+
+```
+set TORCH_COMMAND=pip install torch --index-url https://download.pytorch.org/whl/cu118
+```
+
+## Installation
+Example instructions for Automatic1111:
+
+* Start the webui-user.bat
+* Select the Extensions tab and click on Install from URL
+* Copy the link to this repository and paste it into URL for extension's git repository
+* Click Install
+
+## How to use
+
+1. Click `Export and Optimize ONNX` button under the `OnnxRuntime` tab to generate ONNX models.
+2. Go to Settings → User Interface → Quick Settings List, add  `sd_unet` and `ort_static_dims`. Apply these settings, then reload the UI.
+3. Back in the main UI, select `Automatic` or corresponding ORT model under `sd_unet` dropdown menu at the top of the page.
+4. If your batch size, image width and height are not changed frequently, select the `ORT Static Dimensions` to get better performance.
+
+You can now start generating images accelerated by ONNX Runtime. 
 
 ## Contributing
 
