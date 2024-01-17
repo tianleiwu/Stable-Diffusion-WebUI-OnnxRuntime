@@ -13,11 +13,11 @@ LoRA and ControlNet are not supported at this time.
 
 Image dimensions need to be specified as multiples of 64.
 
-If you use dev branch of Automatic1111, please add the following line to webui-user.bat to use Torch of cuda 11.8:
-
+To run turbo models, you can install dev branch of Automatic1111. Please add the following line to webui-user.bat to use Torch of cuda 11.8 since installed onnxruntime-gpu does not support CUDA 12:
 ```
 set TORCH_COMMAND=pip install torch --index-url https://download.pytorch.org/whl/cu118
 ```
+It is recommended to run with `LCM` sampling method and CFG Scale = 1.0, and enable `ORT CFG Optimization` to get better performance.
 
 ## Installation
 Example instructions for Automatic1111:
@@ -30,7 +30,7 @@ Example instructions for Automatic1111:
 ## How to use
 
 1. Click `Export and Optimize ONNX` button under the `OnnxRuntime` tab to generate ONNX models.
-2. Go to Settings → User Interface → Quick Settings List, add  `sd_unet` and `ort_static_dims`. Apply these settings, then reload the UI.
+2. Go to Settings → User Interface → Quick Settings List, add  `sd_unet`, `ort_static_dims` and `ort_cfg1_opt`. Apply these settings, then reload the UI.
 3. Back in the main UI, select `Automatic` or corresponding ORT model under `sd_unet` dropdown menu at the top of the page.
 4. If your batch size, image width and height are not changed frequently, select the `ORT Static Dimensions` to get better performance.
 

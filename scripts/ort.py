@@ -63,14 +63,14 @@ class CudaSession:
         self.input_tensors = OrderedDict()
         self.output_tensors = OrderedDict()
 
-    def allocate_buffers(self, shape_dict: Dict[str, Union[Tuple[int], List[int]]]):
+    def allocate_buffers(self, shape_dict: Dict[str, Union[Tuple[int], List[int]]], half_batch_size: bool):
         """Allocate tensors for I/O Binding"""
         if self.enable_cuda_graph:
             for name, shape in shape_dict.items():
                 if name in self.input_names:
                     # Reuse allocated buffer when the shape is same
                     if name in self.input_tensors:
-                        if tuple(self.input_tensors[name].shape) == tuple(shape):
+                        if list(self.input_tensors[name].shape) == shape:
                             continue
                         raise RuntimeError("Expect static input shape for cuda graph")
 
@@ -81,37 +81,45 @@ class CudaSession:
                     ).to(device=self.device)
                     self.input_tensors[name] = tensor
 
+                    # When CFG scale is 1.0, only use the first half since negative prompt is not used.
+                    bind_shape = shape.copy()
+                    if half_batch_size:
+                        bind_shape[0] = bind_shape[0] // 2
+
                     self.io_binding.bind_input(
                         name,
                         tensor.device.type,
                         tensor.device.index,
                         numpy_dtype,
-                        list(tensor.size()),
+                        bind_shape,
                         tensor.data_ptr(),
                     )
 
         for name, shape in shape_dict.items():
             if name in self.output_names:
                 # Reuse allocated buffer when the shape is same
-                if name in self.output_tensors and tuple(self.output_tensors[name].shape) == tuple(shape):
-                    continue
+                if not (name in self.output_tensors and list(self.output_tensors[name].shape) == shape):
+                    numpy_dtype = self.io_name_to_numpy_type[name]
+                    tensor = torch.zeros(tuple(shape), dtype=TypeHelper.numpy_type_to_torch_type(numpy_dtype)).to(
+                        device=self.device
+                    )
+                    self.output_tensors[name] = tensor
 
-                numpy_dtype = self.io_name_to_numpy_type[name]
-                tensor = torch.empty(tuple(shape), dtype=TypeHelper.numpy_type_to_torch_type(numpy_dtype)).to(
-                    device=self.device
-                )
-                self.output_tensors[name] = tensor
+                # When CFG scale is 1.0, only use the first half since negative prompt is not used.
+                bind_shape = shape.copy()
+                if half_batch_size:
+                    bind_shape[0] = bind_shape[0] // 2
 
                 self.io_binding.bind_output(
                     name,
                     tensor.device.type,
                     tensor.device.index,
                     numpy_dtype,
-                    list(tensor.size()),
+                    bind_shape,
                     tensor.data_ptr(),
                 )
 
-    def infer(self, feed_dict: Dict[str, torch.Tensor]):
+    def infer(self, feed_dict: Dict[str, torch.Tensor], half_batch_size):
         """Bind input tensors and run inference"""
         for name, tensor in feed_dict.items():
             assert isinstance(tensor, torch.Tensor) and tensor.is_contiguous()
@@ -123,18 +131,27 @@ class CudaSession:
                     # Update input tensor inplace since cuda graph requires input and output has fixed memory address.
                     self.input_tensors[name].copy_(tensor)
                 else:
+                    # When CFG scale is 1.0, only use the first half since negative prompt is not used.
+                    bind_shape = list(tensor.shape)
+                    if half_batch_size:
+                        bind_shape[0] = bind_shape[0] // 2
+
                     self.io_binding.bind_input(
                         name,
                         tensor.device.type,
                         tensor.device.index,
                         TypeHelper.torch_type_to_numpy_type(tensor.dtype),
-                        [1] if len(tensor.shape) == 0 else list(tensor.shape),
+                        bind_shape,
                         tensor.data_ptr(),
                     )
 
+        # TODO: Pass cuda stream to ORT so that we need not synchronize inputs and outputs
+        # TODO: Also add disable_synchronize_execution_providers in run options, see https://github.com/microsoft/onnxruntime/pull/14088
         self.io_binding.synchronize_inputs()
         self.ort_session.run_with_iobinding(self.io_binding)
-        self.io_binding.synchronize_outputs()
+
+        # run_with_iobinding has synchronization and we binded the output buffer in device, so no need to synchronize_outputs.
+        # self.io_binding.synchronize_outputs()
 
         return self.output_tensors
 
@@ -159,9 +176,11 @@ class OrtUnet(sd_unet.SdUnet):
         self.sess_options = None
 
         self.last_input_shape = None
+        self.last_half_batch_size = None
         self.is_static_input_shape = True
 
-        self.do_classifier_free_guidance = True
+        self.batch_size = 1
+        self.use_cfg1_opt = True
 
         self.verbose = False
         if self.verbose:
@@ -179,7 +198,16 @@ class OrtUnet(sd_unet.SdUnet):
 
     def infer(self, feed_dict):
         is_static = shared.opts.data.get("ort_static_dims", False)
-        is_shape_changed = feed_dict["sample"].shape != self.last_input_shape and self.last_input_shape is not None
+
+        input_shape = list(feed_dict["sample"].shape)
+
+        half_batch_size = False
+        if self.use_cfg1_opt and input_shape[0] == self.batch_size * 2:
+            half_batch_size = True
+            input_shape[0] = input_shape[0] // 2
+
+        is_shape_changed = input_shape != self.last_input_shape and self.last_input_shape is not None
+        is_half_changed = half_batch_size != self.last_half_batch_size and self.last_half_batch_size is not None
 
         if (
             self.session is None
@@ -193,13 +221,14 @@ class OrtUnet(sd_unet.SdUnet):
                     Disable `ORT Static Dimensions` from Settings if you expect to change image size/batch size frequently"
                 )
             self.create_session()
-        elif is_shape_changed:
+        elif is_shape_changed or is_half_changed:
             if self.verbose:
                 print("reset_io_binding")
             self.session.reset_io_binding()
 
-        if feed_dict["sample"].shape != self.last_input_shape:
-            self.last_input_shape = feed_dict["sample"].shape
+        if input_shape != self.last_input_shape or is_half_changed:
+            self.last_input_shape = input_shape
+            self.last_half_batch_size = half_batch_size
             shape_dict = {
                 "sample": list(feed_dict["sample"].shape),
                 "timesteps": list(feed_dict["timesteps"].shape),
@@ -209,7 +238,7 @@ class OrtUnet(sd_unet.SdUnet):
             if "y" in feed_dict:
                 shape_dict["y"] = list(feed_dict["y"].shape)
 
-            self.session.allocate_buffers(shape_dict)
+            self.session.allocate_buffers(shape_dict, half_batch_size)
 
             if self.verbose:
                 print(shape_dict)
@@ -217,7 +246,7 @@ class OrtUnet(sd_unet.SdUnet):
         inputs = {}
         for name, tensor in feed_dict.items():
             inputs[name] = tensor
-        return self.session.infer(inputs)
+        return self.session.infer(inputs, half_batch_size)
 
     def create_session(self):
         if self.verbose:
@@ -301,8 +330,8 @@ class OrtUnet(sd_unet.SdUnet):
         devices.torch_gc()
 
     def start_batch(self, batch_size: int, width: int, height: int, cfg_scale: float):
-        self.do_classifier_free_guidance = cfg_scale > 1.0
-        pass
+        self.batch_size = batch_size
+        self.use_cfg1_opt = shared.opts.data.get("ort_cfg1_opt", False) and (cfg_scale <= 1.0)
 
 
 class OnnxRuntimeScript(scripts.Script):
@@ -518,6 +547,17 @@ def on_ui_settings():
         shared.OptionInfo(
             False,
             "ORT Static Dimensions",
+            gr.Checkbox,
+            {"interactive": True},
+            section=section,
+        ),
+    )
+
+    shared.opts.add_option(
+        "ort_cfg1_opt",
+        shared.OptionInfo(
+            False,
+            "ORT CFG Optimization",
             gr.Checkbox,
             {"interactive": True},
             section=section,
