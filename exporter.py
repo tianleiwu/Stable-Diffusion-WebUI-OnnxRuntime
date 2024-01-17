@@ -174,8 +174,11 @@ def optimize_onnx(
                 use_external_data=use_external_data,
             )
 
-            shutil.remove(fusion_onnx_path)
-            shutil.remove(fusion_onnx_path + ".data")
+            # After we have the optimized onnx, we can remove the temporary onnx file from step 1.
+            os.remove(fusion_onnx_path)
+            data_file = fusion_onnx_path + ".data"
+            if os.path.exists(data_file):
+                os.remove(data_file)
 
         e = time.time()
         logger.info(f"Time taken to build: {(e-s)}s")
