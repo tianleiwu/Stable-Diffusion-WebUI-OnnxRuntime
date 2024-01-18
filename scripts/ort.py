@@ -16,8 +16,8 @@ from modules import devices, script_callbacks, scripts, sd_unet, shared
 from onnxruntime.transformers.io_binding_helper import TypeHelper
 
 import ui_ort
-from model_config import ModelType
-from model_manager import ORT_MODEL_DIR, modelmanager
+from ort_model_config import ModelType
+from ort_model_manager import ORT_MODEL_DIR, modelmanager
 
 
 class OrtUnetOption(sd_unet.SdUnetOption):
@@ -545,10 +545,10 @@ def on_ui_settings():
     shared.opts.add_option(
         "ort_static_dims",
         shared.OptionInfo(
-            False,
-            "ORT Static Dimensions",
-            gr.Checkbox,
-            {"interactive": True},
+            default=False,
+            label="ORT Static Dimensions",
+            component=gr.Checkbox,
+            component_args={"interactive": True},
             section=section,
         ),
     )
@@ -556,10 +556,10 @@ def on_ui_settings():
     shared.opts.add_option(
         "ort_cfg1_opt",
         shared.OptionInfo(
-            False,
-            "ORT CFG Optimization",
-            gr.Checkbox,
-            {"interactive": True},
+            default=True,
+            label="ORT CFG Optimization",
+            component=gr.Checkbox,
+            component_args={"interactive": True},
             section=section,
         ),
     )

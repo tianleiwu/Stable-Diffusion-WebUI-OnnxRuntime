@@ -24,7 +24,7 @@ from typing import List, Tuple
 import torch
 from modules import sd_hijack, sd_unet
 
-from model_config import ProfileSettings
+from ort_model_config import ProfileSettings
 
 
 class UNetModel(torch.nn.Module):

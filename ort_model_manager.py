@@ -6,12 +6,14 @@ from logging import info, warning
 import torch
 from modules import paths_internal
 
-from model_config import ModelConfig, ModelConfigEncoder
+from ort_model_config import ModelConfig, ModelConfigEncoder
 
-ONNX_MODEL_DIR = os.path.join(paths_internal.models_path, "Unet-onnx")
+# This directory caches all onnx models exported by torch.
+ONNX_MODEL_DIR = os.path.join(paths_internal.models_path, "Unet-ort-export")
 if not os.path.exists(ONNX_MODEL_DIR):
     os.makedirs(ONNX_MODEL_DIR)
 
+# This directory contains all onnx models that optimized by ONNX Runtime.
 ORT_MODEL_DIR = os.path.join(paths_internal.models_path, "Unet-ort")
 if not os.path.exists(ORT_MODEL_DIR):
     os.makedirs(ORT_MODEL_DIR)
@@ -29,10 +31,13 @@ cc_major, cc_minor = get_cc()
 
 
 class ModelManager:
-    def __init__(self, model_file=MODEL_FILE) -> None:
+    def __init__(self, model_file=MODEL_FILE, default_provider="cuda") -> None:
         self.all_models = {}
         self.model_file = model_file
-        self.provider = "cuda"
+
+        # Default execution provider
+        self.default_provider = default_provider
+
         if not os.path.exists(model_file):
             warning("model.json does not exist. Creating new one.")
         else:
@@ -46,8 +51,10 @@ class ModelManager:
         onnx_path = os.path.join(ONNX_MODEL_DIR, onnx_filename)
         return onnx_filename, onnx_path
 
-    def get_engine_path(self, model_name, model_hash, suffix=None):
-        engine_filename = "_".join([model_name, model_hash, self.provider if suffix is None else suffix]) + ".onnx"
+    def get_engine_path(self, model_name, model_hash, provider=None):
+        if provider is None:
+            provider = self.default_provider
+        engine_filename = "_".join([model_name, model_hash, provider]) + ".onnx"
         engine_path = os.path.join(ORT_MODEL_DIR, engine_filename)
 
         return engine_filename, engine_path
@@ -75,25 +82,20 @@ class ModelManager:
     def __del__(self):
         self.update()
 
-    def add_entry(
-        self,
-        model_name,
-        model_hash,
-        profile,
-        fp32,
-        inpaint,
-        unet_hidden_dim,
-    ):
+    def add_entry(self, model_name, model_hash, profile, fp32, inpaint, unet_hidden_dim, provider=None):
+        if provider is None:
+            provider = self.default_provider
+
         config = ModelConfig(profile, fp32, inpaint, unet_hidden_dim)
         ort_name, _ort_path = self.get_engine_path(model_name, model_hash)
 
-        if self.provider not in self.all_models:
-            self.all_models[self.provider] = {}
+        if provider not in self.all_models:
+            self.all_models[provider] = {}
 
-        if model_name not in self.all_models[self.provider]:
-            self.all_models[self.provider][model_name] = []
+        if model_name not in self.all_models[provider]:
+            self.all_models[provider][model_name] = []
 
-        self.all_models[self.provider][model_name].append({"filepath": ort_name, "config": config})
+        self.all_models[provider][model_name].append({"filepath": ort_name, "config": config})
 
         self.update()
 
@@ -114,8 +116,11 @@ class ModelManager:
                     out[provider][base_model][i]["config"] = ModelConfig(**configs[i]["config"])
         return out
 
-    def available_models(self):
-        available = self.all_models.get(self.provider, {})
+    def available_models(self, provider=None):
+        if provider is None:
+            provider = self.default_provider
+
+        available = self.all_models.get(provider, {})
         return available
 
     def get_valid_models(

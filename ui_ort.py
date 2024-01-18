@@ -14,10 +14,10 @@ from modules import sd_hijack, shared
 from modules.ui_common import refresh_symbol
 from modules.ui_components import FormRow, ToolButton
 
-from exporter import export_onnx, optimize_onnx
-from model_config import ProfilePrests
-from model_helper import UNetModel
-from model_manager import cc_major, cc_minor, modelmanager
+from ort_exporter import export_onnx, optimize_onnx
+from ort_model_config import ProfilePrests
+from ort_model_helper import UNetModel
+from ort_model_manager import cc_major, cc_minor, modelmanager
 
 profile_presets = ProfilePrests()
 

@@ -9,8 +9,8 @@ import onnx
 import torch
 import torch.nn.functional as F
 
-from model_config import ProfileSettings
-from model_helper import UNetModel
+from ort_model_config import ProfileSettings
+from ort_model_helper import UNetModel
 from ort_optimizer import OrtStableDiffusionOptimizer
 
 logger = getLogger(__name__)
@@ -151,7 +151,7 @@ def optimize_onnx(
                 use_external_data=use_external_data,
             )
         else:
-            fusion_onnx_path = input_onnx_path[: len(input_onnx_path) - 5] + "_fusion.onnx"
+            fusion_onnx_path = input_onnx_path[:-5] + "_fusion.onnx"
             if os.path.exists(fusion_onnx_path):
                 print("skip fusion since path exists", fusion_onnx_path)
             else:
