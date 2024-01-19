@@ -52,7 +52,9 @@ def export_onnx(
         del onnx_model
         return
 
-    logger.info("Exporting to ONNX...")
+    s = time.time()
+
+    print("Exporting to ONNX...")
     inputs = modelobj.get_sample_input(
         profile.bs_opt * 2,
         profile.h_opt // 8,
@@ -68,7 +70,7 @@ def export_onnx(
     tmp_path = os.path.join(tmp_dir, "model.onnx")
 
     try:
-        logger.info("Exporting to ONNX...")
+        logger.info("Exporting ONNX to %s", tmp_path)
         with torch.inference_mode(), torch.autocast("cuda"):
             torch.onnx.export(
                 model,
@@ -82,7 +84,7 @@ def export_onnx(
                 dynamic_axes=modelobj.get_dynamic_axes(),
             )
     except Exception as e:
-        logger.error(f"Exporting to ONNX failed. {e}")
+        print(f"Exporting to ONNX failed. {e}")
         return
 
     os.makedirs(path.parent, exist_ok=True)
@@ -115,6 +117,9 @@ def export_onnx(
         else:
             shutil.move(tmp_path, str(path))
 
+    e = time.time()
+    print(f"Exported ONNX {path} in {int(e-s)} seconds")
+
     shutil.rmtree(tmp_dir)
     del onnx_model
 
@@ -126,7 +131,7 @@ def optimize_onnx(
     model_type: str = "unet",
     use_external_data: bool = False,
 ):
-    logger.info("Optimizing ONNX...")
+    print("Optimizing ONNX...")
 
     tmp_dir = os.path.abspath("onnx_opt_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
@@ -181,10 +186,9 @@ def optimize_onnx(
                 os.remove(data_file)
 
         e = time.time()
-        logger.info(f"Time taken to build: {(e-s)}s")
-        print(f"Optimized onnx model: {optimized_onnx_path}.")
+        print(f"Optimized onnx {optimized_onnx_path} in {int(e-s)} seconds")
     except Exception as e:
-        logger.error(f"Optimizing ONNX failed. {e}")
+        print(f"Optimizing ONNX failed. {e}")
         is_ok = False
 
     shutil.rmtree(tmp_dir)

@@ -34,7 +34,7 @@ class FusionAttentionUnet(Fusion):
     ):
         super().__init__(
             model,
-            "MultiHeadAttention" if is_cross_attention else "Attention",
+            "Attention" if is_cross_attention and enable_packed_qkv else "MultiHeadAttention",
             ["LayerNormalization"],
         )
         self.hidden_size = hidden_size

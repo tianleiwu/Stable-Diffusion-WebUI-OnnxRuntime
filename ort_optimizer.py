@@ -34,7 +34,6 @@ class OrtStableDiffusionOptimizer:
             "unet": UnetOnnxModel,
             "vae": VaeOnnxModel,
         }
-        self.verbose = False
 
     def print_memory_usage(self, message):
         gb = float(1024**3)
@@ -57,9 +56,6 @@ class OrtStableDiffusionOptimizer:
 
         del onnx_model
         gc.collect()
-
-        if self.verbose:
-            self.print_memory_usage("before optimize_by_ort")
 
         # Disable some optimizers that might cause failure in symbolic shape inference or attention fusion.
         disabled_optimizers = [
@@ -100,8 +96,7 @@ class OrtStableDiffusionOptimizer:
         """Optimize onnx model using ONNX Runtime transformers optimizer"""
         logger.info(f"Optimize {input_fp32_onnx_path}...")
 
-        if self.verbose:
-            self.print_memory_usage("before optimize")
+        self.print_memory_usage("before optimize")
 
         model = onnx.load_model(input_fp32_onnx_path, load_external_data=True)
         m = self.model_type_class_mapping[self.model_type](model)
@@ -114,9 +109,6 @@ class OrtStableDiffusionOptimizer:
             if self.model_type in ["unet"] and not final_target_float16:
                 fusion_options.enable_packed_kv = False
                 fusion_options.enable_packed_qkv = False
-
-            if self.verbose:
-                self.print_memory_usage("before optimize_by_fusion")
 
             m.optimize(fusion_options)
             m.topological_sort()
@@ -137,13 +129,11 @@ class OrtStableDiffusionOptimizer:
         m.get_operator_statistics()
         m.get_fused_operator_statistics()
         m.save_model_to_file(optimized_onnx_path, use_external_data_format=use_external_data)
-        print(f"{self.model_type} is optimized: {optimized_onnx_path}")
+        logger.info(f"{self.model_type} is optimized: {optimized_onnx_path}")
 
         del model
         del m
         gc.collect()
-        if self.verbose:
-            self.print_memory_usage("after optimize")
 
     def optimize_step1(
         self,
@@ -159,8 +149,7 @@ class OrtStableDiffusionOptimizer:
         """Optimize onnx model using ONNX Runtime transformers optimizer"""
         logger.info(f"Optimize {input_fp32_onnx_path}...")
 
-        if self.verbose:
-            self.print_memory_usage("before optimize")
+        self.print_memory_usage("before optimize")
 
         model = onnx.load_model(input_fp32_onnx_path, load_external_data=True)
         m = self.model_type_class_mapping[self.model_type](model)
@@ -176,9 +165,6 @@ class OrtStableDiffusionOptimizer:
             fusion_options.enable_packed_kv = False
             fusion_options.enable_packed_qkv = False
 
-        if self.verbose:
-            self.print_memory_usage("before optimize_by_fusion")
-
         m.optimize(fusion_options)
         m.topological_sort()
         m.model.producer_name = "onnxruntime.transformers"
@@ -186,13 +172,7 @@ class OrtStableDiffusionOptimizer:
         if keep_outputs:
             m.prune_graph(outputs=keep_outputs)
 
-        m.get_operator_statistics()
-        m.get_fused_operator_statistics()
-
         if float16:
-            if self.verbose:
-                self.print_memory_usage("convert_float_to_float16")
-
             m.convert_float_to_float16(
                 keep_io_types=keep_io_types,
                 op_block_list=fp32_op_list,
@@ -200,12 +180,12 @@ class OrtStableDiffusionOptimizer:
 
         m.save_model_to_file(fusion_onnx_path, use_external_data_format=use_external_data)
 
-        print(f"{self.model_type} afer optimizing by fusion: {fusion_onnx_path}")
+        m.get_operator_statistics()
+        m.get_fused_operator_statistics()
+
+        print(f"{self.model_type} after optimizing by fusion: {fusion_onnx_path}")
 
     def optimize_step2(self, fusion_onnx_path, optimized_onnx_path, use_external_data):
-        if self.verbose:
-            self.print_memory_usage("optimize_step2")
-
         # Disable some optimizers that might cause failure in symbolic shape inference or attention fusion.
         disabled_optimizers = [
             "ConstantSharing",
@@ -225,4 +205,4 @@ class OrtStableDiffusionOptimizer:
             external_data_filename=Path(optimized_onnx_path).name + "data",
         )
 
-        print(f"{self.model_type} is optimized: {optimized_onnx_path}")
+        logger.info(f"{self.model_type} is optimized: {optimized_onnx_path}")
