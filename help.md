@@ -23,13 +23,14 @@ The first batch for a combination of image resolution and batch size will take l
 
 When `ORT Static Dimensions` is enabled, ONNX Runtime will enable CUDA graph to get better performance when image size or batch size are the same. However, if image size or batch size changes, ONNX Runtime will create a new session which causes extra latency in the first inference. If you enable `HiRes. fix` to upscale image, it is better to disable `ORT Static Dimensions` since image size changes in upscaling.
 
-If you install dev branch of Automatic1111, please add the following line to webui-user.bat to use Torch of cuda 11.8 since installed onnxruntime-gpu does not support CUDA 12:
+If you install dev branch of Automatic1111, PyTorch is for CUDA 12 by default. There is an option to use CUDA 11.8 by adding the following line to webui-user.bat:
 ```
 set TORCH_COMMAND=pip install torch --index-url https://download.pytorch.org/whl/cu118
 ```
+If you add this option, this extension will install onnxruntime-gpu, and you will need install CUDA 11.8 and latest cuDNN for CUDA 11.8 to your machine.
+If you use CUDA 12, the extension will install ort-nightly-gpu and you will need install CUDA 12.* and latest cuDNN for CUDA 12.* in your machine.
 
-For Turbo models, For Turbo, it is recommended to use CFG Scale=1.0 and `LCM` sampling method in dev branch of A1111. `ORT CFG Optimization` is enabled by default to get better performance for CFG Scale = 1.0. To eanble/disable it, you can use Settings → User Interface → Quick Settings, and add `ort_cfg1_opt`. Click `Apply Settings` button, then `Reload UI` button.
-
+For Turbo models, `ORT CFG Optimization` is enabled by default to get better performance for CFG Scale=1.0. To disable it, you can use Settings → User Interface → Quick Settings, and add `ort_cfg1_opt`. Click `Apply Settings` button, then `Reload UI` button. For SDXL-Turbo or SD-Turbo, it is recommended to try `Euler a` or `LCM` sampling method (in dev branch of A1111).
 
 For more information, please visit the ONNX Runtime Extension GitHub page [here](https://github.com/tianleiwu/Stable-Diffusion-WebUI-OnnxRuntime).
 </ol>
