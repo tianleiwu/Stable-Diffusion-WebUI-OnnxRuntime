@@ -21,10 +21,10 @@ from ort_model_manager import ORT_MODEL_DIR, modelmanager
 
 
 class OrtUnetOption(sd_unet.SdUnetOption):
-    def __init__(self, name: str, filename: List[dict]):
-        self.label = f"[ORT] {name}"
-        self.model_name = name
-        self.configs = filename
+    def __init__(self, model_name: str, configs: List[dict]):
+        self.label = "[ORT] " + configs[0]["filepath"][:-5]
+        self.model_name = model_name
+        self.configs = configs
 
     def create_unet(self):
         return OrtUnet(self.model_name, self.configs)
@@ -100,9 +100,10 @@ class CudaSession:
                 # Reuse allocated buffer when the shape is same
                 if not (name in self.output_tensors and list(self.output_tensors[name].shape) == shape):
                     numpy_dtype = self.io_name_to_numpy_type[name]
-                    tensor = torch.zeros(tuple(shape), dtype=TypeHelper.numpy_type_to_torch_type(numpy_dtype)).to(
-                        device=self.device
-                    )
+                    tensor = torch.zeros(
+                        tuple(shape),
+                        dtype=TypeHelper.numpy_type_to_torch_type(numpy_dtype),
+                    ).to(device=self.device)
                     self.output_tensors[name] = tensor
 
                 # When CFG scale is 1.0, only use the first half since negative prompt is not used.
@@ -446,7 +447,7 @@ class OnnxRuntimeScript(scripts.Script):
 
         if self.verbose:
             print(
-                f"process sd_unet_option.model_name={sd_unet_option.model_name} p.sd_model_name={p.sd_model_name} sd_model_hash={p.sd_model_hash} sd_vae_name={p.sd_vae_name} sd_vae_hash={p.sd_vae_hash} cfg_scale={p.cfg_scale} refiner_checkpoint={p.refiner_checkpoint} args={args}"
+                f"process sd_unet_option.model_name={sd_unet_option.model_name} p.sd_model_name={p.sd_model_name} p.sd_model_hash={p.sd_model_hash} sd_vae_name={p.sd_vae_name} sd_vae_hash={p.sd_vae_hash} cfg_scale={p.cfg_scale} refiner_checkpoint={p.refiner_checkpoint} args={args}"
             )
 
         if sd_unet_option.model_name != model_name:
@@ -465,7 +466,7 @@ class OnnxRuntimeScript(scripts.Script):
         self.torch_unet = self.idx is None or self.hr_idx is None
 
         if self.verbose:
-            print(f"idx={ self.idx} hr_idx={self.hr_idx} torch_unet={self.torch_unet}")
+            print(f"idx={self.idx} hr_idx={self.hr_idx} torch_unet={self.torch_unet}")
 
         if not self.torch_unet:
             self.get_loras(p)
@@ -534,9 +535,7 @@ class OnnxRuntimeScript(scripts.Script):
 def list_unets(l):
     model = modelmanager.available_models()
     for k, v in model.items():
-        v[0] if isinstance(v, list) else v
-        label = k
-        l.append(OrtUnetOption(label, v))
+        l.append(OrtUnetOption(model_name=k, configs=v))
 
 
 def on_ui_settings():

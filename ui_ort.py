@@ -19,6 +19,8 @@ from ort_model_config import ProfilePrests
 from ort_model_helper import UNetModel
 from ort_model_manager import cc_major, cc_minor, modelmanager
 
+logger = logging.getLogger(__name__)
+
 profile_presets = ProfilePrests()
 
 logging.basicConfig(level=logging.INFO)
@@ -48,18 +50,22 @@ def export_unet_to_ort(force_export):
 
     is_xl = shared.sd_model.is_sdxl
     info = shared.sd_model.sd_checkpoint_info
-    model_name = info.model_name
-    model_hash = info.hash
-    print(
-        f"Checkpoint info: shorttitle={info.short_title} shorthash={info.shorthash} model_name={model_name} model_hash={model_hash} name={info.name} name_for_extra={info.name_for_extra} metadata={info.metadata}"
+
+    # Assume that we put model under a subdirectory like sd/v1-5-pruned-emaonly.safetensors, the information is like the following:
+    #   shorttitle=v1-5-pruned-emaonly [6ce0161689] shorthash=6ce0161689 model_name=sd_v1-5-pruned-emaonly hash=d7049739 name=sd/v1-5-pruned-emaonly.safetensors name_for_extra=v1-5-pruned-emaonly
+    # Here we choose the name and hash to match the short title shown in the checkpoint list. Another benefit is that, when checkpoint is moved to sub-directory, onnx model name does not change.
+    model_name = info.name_for_extra
+    model_hash = info.shorthash
+    logger.debug(
+        f"Checkpoint info: shorttitle={info.short_title} shorthash={info.shorthash} model_name={info.model_name} hash={info.hash} name={info.name} name_for_extra={info.name_for_extra}"
     )
 
     use_fp32 = is_fp32()
     profile_settings = profile_presets.get_default(is_xl=is_xl)
     profile_settings.token_to_dim()
-    print(f"Exporting checkpoint to OnnxRuntime using profile setting: {profile_settings}")
+    print(f"Exporting checkpoint {info.short_title} to OnnxRuntime using profile setting: {profile_settings}")
 
-    onnx_filename, onnx_path = modelmanager.get_onnx_path(model_name)
+    onnx_filename, onnx_path = modelmanager.get_onnx_path(model_name, model_hash)
     embedding_dim = get_context_dim()
 
     modelobj = UNetModel(
@@ -80,8 +86,8 @@ def export_unet_to_ort(force_export):
     ort_engine_filename, ort_engine_path = modelmanager.get_engine_path(model_name, model_hash)
 
     if not os.path.exists(ort_engine_path) or force_export:
-        print("Building OnnxRuntime engine... This can take a while, please check the progress in the terminal.")
-        gr.Info("Building OnnxRuntime engine... This can take a while, please check the progress in the terminal.")
+        print("Optimize ONNX for OnnxRuntime... This can take a while, please check the progress in the terminal.")
+        gr.Info("Optimize ONNX for OnnxRuntime... This can take a while, please check the progress in the terminal.")
 
         # Unload model to CPU to free GPU memory so that ORT has enough memory to create session in GPU.
         free, total = torch.cuda.mem_get_info()
@@ -109,9 +115,10 @@ def export_unet_to_ort(force_export):
 
     # Allow it to add to JSON for recovering json file.
     profile = modelobj.get_input_profile(profile_settings)
+
     modelmanager.add_entry(
-        model_name,
-        model_hash,
+        info.model_name,  # pass the full model name to match in "Automatic": https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/cf2772fab0af5573da775e7437e6acdca424f26e/modules/sd_unet.py#L24
+        ort_engine_filename,
         profile,
         fp32=use_fp32,
         inpaint=modelobj.in_channels == 6,

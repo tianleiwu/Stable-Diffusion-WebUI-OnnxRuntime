@@ -46,8 +46,8 @@ class ModelManager:
         self.update()
 
     @staticmethod
-    def get_onnx_path(model_name):
-        onnx_filename = f"{model_name}.onnx"
+    def get_onnx_path(model_name, model_hash):
+        onnx_filename = f"{model_name}_{model_hash}.onnx"
         onnx_path = os.path.join(ONNX_MODEL_DIR, onnx_filename)
         return onnx_filename, onnx_path
 
@@ -82,12 +82,20 @@ class ModelManager:
     def __del__(self):
         self.update()
 
-    def add_entry(self, model_name, model_hash, profile, fp32, inpaint, unet_hidden_dim, provider=None):
+    def add_entry(
+        self,
+        model_name,
+        filename,
+        profile,
+        fp32,
+        inpaint,
+        unet_hidden_dim,
+        provider=None,
+    ):
         if provider is None:
             provider = self.default_provider
 
         config = ModelConfig(profile, fp32, inpaint, unet_hidden_dim)
-        ort_name, _ort_path = self.get_engine_path(model_name, model_hash)
 
         if provider not in self.all_models:
             self.all_models[provider] = {}
@@ -95,7 +103,7 @@ class ModelManager:
         if model_name not in self.all_models[provider]:
             self.all_models[provider][model_name] = []
 
-        self.all_models[provider][model_name].append({"filepath": ort_name, "config": config})
+        self.all_models[provider][model_name].append({"filepath": filename, "config": config})
 
         self.update()
 
