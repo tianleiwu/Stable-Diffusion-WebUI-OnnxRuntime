@@ -40,7 +40,8 @@ def install():
                     live=True,
                 )
 
-        cuda12_wheel = os.path.join(WHEEL_DIR, "onnxruntime_gpu-1.18.0-cp310-cp310-linux_x86_64.whl")
+        # You can put onnxruntime-gpu wheel to ..\..\wheel_cuda12\ relative to this file for testing purpose.
+        cuda12_wheel = os.path.join(WHEEL_DIR, "onnxruntime_gpu-1.18.0-cp310-cp310-linux_x86_64.whl" if sys.platform == "linux" else "onnxruntime_gpu-1.18.0-cp310-cp310-win_amd64.whl")
         if os.path.exists(cuda12_wheel):
             name = "ort-nightly-gpu"
             if launch.is_installed(name):
