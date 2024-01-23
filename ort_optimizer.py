@@ -18,10 +18,9 @@ import onnx
 import psutil
 import torch
 from onnxruntime.transformers.fusion_options import FusionOptions
+from onnxruntime.transformers.onnx_model_unet import UnetOnnxModel
 from onnxruntime.transformers.onnx_model_vae import VaeOnnxModel
 from onnxruntime.transformers.optimizer import optimize_by_onnxruntime
-
-from onnx_model_unet import UnetOnnxModel
 
 logger = logging.getLogger(__name__)
 
@@ -57,21 +56,10 @@ class OrtStableDiffusionOptimizer:
         del onnx_model
         gc.collect()
 
-        # Disable some optimizers that might cause failure in symbolic shape inference or attention fusion.
-        disabled_optimizers = [
-            "ConstantSharing",
-            "MatMulScaleFusion",
-            "MatMulAddFusion",
-            "MatmulTransposeFusion",
-            "GemmActivationFusion",
-            "BiasSoftmaxFusion",
-        ]
-
         ort_optimized_model_path = Path(tmp_dir) / "optimized.onnx"
         optimize_by_onnxruntime(
             str(tmp_model_path),
             use_gpu=True,
-            disabled_optimizers=disabled_optimizers,
             optimized_model_path=str(ort_optimized_model_path),
             save_as_external_data=use_external_data_format,
             external_data_filename="optimized.onnx.data",
@@ -186,20 +174,9 @@ class OrtStableDiffusionOptimizer:
         print(f"{self.model_type} after optimizing by fusion: {fusion_onnx_path}")
 
     def optimize_step2(self, fusion_onnx_path, optimized_onnx_path, use_external_data):
-        # Disable some optimizers that might cause failure in symbolic shape inference or attention fusion.
-        disabled_optimizers = [
-            "ConstantSharing",
-            "MatMulScaleFusion",
-            "MatMulAddFusion",
-            "MatmulTransposeFusion",
-            "GemmActivationFusion",
-            "BiasSoftmaxFusion",
-        ]
-
         optimize_by_onnxruntime(
             str(fusion_onnx_path),
             use_gpu=True,
-            disabled_optimizers=disabled_optimizers,
             optimized_model_path=str(optimized_onnx_path),
             save_as_external_data=use_external_data,
             external_data_filename=Path(optimized_onnx_path).name + "data",

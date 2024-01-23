@@ -9,6 +9,8 @@ from importlib.metadata import version
 import launch
 from modules import paths_internal
 
+from modules import paths_internal
+WHEEL_DIR = os.path.join(paths_internal.data_path, "wheel_cuda12")
 
 def install():
     is_cuda12 = False
@@ -38,17 +40,41 @@ def install():
                     live=True,
                 )
 
-        name = "ort-nightly-gpu"
-        if not launch.is_installed(name):
+        cuda12_wheel = os.path.join(WHEEL_DIR, "onnxruntime_gpu-1.18.0-cp310-cp310-linux_x86_64.whl")
+        if os.path.exists(cuda12_wheel):
+            name = "ort-nightly-gpu"
+            if launch.is_installed(name):
+                print(
+                    f"pip uninstall -y {name}"
+                )
+                launch.run(
+                    f"pip uninstall -y {name}",
+                    desc=f"{name} is removed",
+                    errdesc=f"cannot uninstall {name}",
+                    live=True,
+                )
+                
             print(
-                f"pip install {name} --index-url=https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-12-nightly/pypi/simple/ --no-cache-dir"
+                f"pip install {cuda12_wheel} --no-cache-dir --force-reinstall"
             )
             launch.run(
-                f'"{sys.executable}" -m pip install {name} --index-url=https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-12-nightly/pypi/simple/ --no-cache-dir',
-                desc=f"{name} is installed",
-                errdesc=f"Couldn't install {name}",
+                f'"{sys.executable}" -m pip install {cuda12_wheel} --no-cache-dir',
+                desc=f"{cuda12_wheel} is installed",
+                errdesc=f"Couldn't install {cuda12_wheel}",
                 live=True,
             )
+        else:
+            name = "ort-nightly-gpu"
+            if not launch.is_installed(name):
+                print(
+                    f"pip install {name} --index-url=https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-12-nightly/pypi/simple/ --no-cache-dir"
+                )
+                launch.run(
+                    f'"{sys.executable}" -m pip install {name} --index-url=https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-12-nightly/pypi/simple/ --no-cache-dir',
+                    desc=f"{name} is installed",
+                    errdesc=f"Couldn't install {name}",
+                    live=True,
+                )
     else:
         ort_version = "1.16.3"
         if launch.is_installed("onnxruntime_gpu"):

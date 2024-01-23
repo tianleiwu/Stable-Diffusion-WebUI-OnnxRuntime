@@ -148,8 +148,11 @@ class CudaSession:
 
         # TODO: Pass cuda stream to ORT so that we need not synchronize inputs and outputs
         # TODO: Also add disable_synchronize_execution_providers in run options, see https://github.com/microsoft/onnxruntime/pull/14088
-        self.io_binding.synchronize_inputs()
-        self.ort_session.run_with_iobinding(self.io_binding)
+        #self.io_binding.synchronize_inputs()
+        
+        run_options = ort.RunOptions()
+        run_options.add_run_config_entry("disable_synchronize_execution_providers", "1")
+        self.ort_session.run_with_iobinding(self.io_binding, run_options=run_options)
 
         # run_with_iobinding has synchronization and we binded the output buffer in device, so no need to synchronize_outputs.
         # self.io_binding.synchronize_outputs()
@@ -157,12 +160,17 @@ class CudaSession:
         return self.output_tensors
 
     @staticmethod
-    def get_cuda_provider_options(device_id: int, enable_cuda_graph: bool) -> Dict[str, Any]:
-        return {
+    def get_cuda_provider_options(device_id: int, enable_cuda_graph: bool, use_user_compute_stream:bool=True) -> Dict[str, Any]:
+        options = {
             "device_id": device_id,
             "arena_extend_strategy": "kSameAsRequested",
             "enable_cuda_graph": enable_cuda_graph,
         }
+        
+        if use_user_compute_stream:
+            options["user_compute_stream"] = str(torch.cuda.current_stream().cuda_stream)
+            
+        return options
 
 
 class OrtUnet(sd_unet.SdUnet):
@@ -180,6 +188,8 @@ class OrtUnet(sd_unet.SdUnet):
         self.last_half_batch_size = None
         self.is_static_input_shape = True
 
+        self.last_cuda_stream = None
+        
         self.batch_size = 1
         self.use_cfg1_opt = True
 
@@ -209,7 +219,7 @@ class OrtUnet(sd_unet.SdUnet):
 
         is_shape_changed = input_shape != self.last_input_shape and self.last_input_shape is not None
         is_half_changed = half_batch_size != self.last_half_batch_size and self.last_half_batch_size is not None
-
+        
         if (
             self.session is None
             or is_static != self.is_static_input_shape
@@ -221,6 +231,10 @@ class OrtUnet(sd_unet.SdUnet):
                     "Dimensions changed, restarting ORT inference session, first job may be slow. \
                     Disable `ORT Static Dimensions` from Settings if you expect to change image size/batch size frequently"
                 )
+            self.create_session()
+        elif torch.cuda.current_stream().cuda_stream != self.last_cuda_stream:
+            gr.Info("Cuda stream changed, restarting ORT inference session, first job may be slow.")
+            print("cuda stream changed, restarting session")
             self.create_session()
         elif is_shape_changed or is_half_changed:
             if self.verbose:
@@ -259,10 +273,11 @@ class OrtUnet(sd_unet.SdUnet):
         providers = [
             (
                 "CUDAExecutionProvider",
-                CudaSession.get_cuda_provider_options(device_id, enable_cuda_graph),
+                CudaSession.get_cuda_provider_options(device_id, enable_cuda_graph, use_user_compute_stream=True),
             ),
             "CPUExecutionProvider",
         ]
+        
         if self.verbose:
             print(providers)
 
@@ -271,7 +286,6 @@ class OrtUnet(sd_unet.SdUnet):
         ort.set_default_logger_severity(3)
         # When the model has been optimized by onnxruntime, we can disable optimization to save session creation time.
         self.sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        # TODO: pass torch.cuda.current_stream().cuda_stream to user_compute_stream
 
         onnx_path = self.get_onnx_path()
         if self.verbose:
@@ -286,6 +300,8 @@ class OrtUnet(sd_unet.SdUnet):
         self.last_input_shape = None
         self.is_static_input_shape = enable_cuda_graph
 
+        self.last_cuda_stream = torch.cuda.current_stream().cuda_stream
+        
     def forward(
         self,
         x: torch.Tensor,
