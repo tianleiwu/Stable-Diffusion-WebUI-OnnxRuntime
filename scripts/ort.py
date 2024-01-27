@@ -14,6 +14,7 @@ import onnxruntime as ort
 import torch
 from modules import devices, script_callbacks, scripts, sd_unet, shared
 from onnxruntime.transformers.io_binding_helper import TypeHelper
+from packaging import version
 
 import ui_ort
 from ort_model_config import ModelType
@@ -37,7 +38,8 @@ class CudaSession:
         self,
         ort_session: ort.InferenceSession,
         device: torch.device,
-        enable_cuda_graph=False,
+        enable_cuda_graph: bool = False,
+        user_compute_stream: int = 0,
     ):
         self.ort_session = ort_session
         self.input_names = [input.name for input in self.ort_session.get_inputs()]
@@ -46,6 +48,7 @@ class CudaSession:
         self.io_binding = self.ort_session.io_binding()
 
         self.enable_cuda_graph = enable_cuda_graph
+        self.user_compute_stream = user_compute_stream
 
         self.input_tensors = OrderedDict()
         self.output_tensors = OrderedDict()
@@ -146,30 +149,30 @@ class CudaSession:
                         tensor.data_ptr(),
                     )
 
-        # TODO: Pass cuda stream to ORT so that we need not synchronize inputs and outputs
-        # TODO: Also add disable_synchronize_execution_providers in run options, see https://github.com/microsoft/onnxruntime/pull/14088
-        #self.io_binding.synchronize_inputs()
-        
-        run_options = ort.RunOptions()
-        run_options.add_run_config_entry("disable_synchronize_execution_providers", "1")
-        self.ort_session.run_with_iobinding(self.io_binding, run_options=run_options)
-
-        # run_with_iobinding has synchronization and we binded the output buffer in device, so no need to synchronize_outputs.
-        # self.io_binding.synchronize_outputs()
+        if self.user_compute_stream == 0:
+            self.io_binding.synchronize_inputs()
+            self.ort_session.run_with_iobinding(self.io_binding)
+            # When there is no user compute stream, run_with_iobinding has synchronization, need not call synchronize_outputs since we binded the output buffer in device.
+        else:
+            run_options = ort.RunOptions()
+            run_options.add_run_config_entry("disable_synchronize_execution_providers", "1")
+            self.ort_session.run_with_iobinding(self.io_binding, run_options=run_options)
 
         return self.output_tensors
 
     @staticmethod
-    def get_cuda_provider_options(device_id: int, enable_cuda_graph: bool, use_user_compute_stream:bool=True) -> Dict[str, Any]:
+    def get_cuda_provider_options(
+        device_id: int, enable_cuda_graph: bool, user_compute_stream: int = 0
+    ) -> Dict[str, Any]:
         options = {
             "device_id": device_id,
             "arena_extend_strategy": "kSameAsRequested",
             "enable_cuda_graph": enable_cuda_graph,
         }
-        
-        if use_user_compute_stream:
-            options["user_compute_stream"] = str(torch.cuda.current_stream().cuda_stream)
-            
+
+        if user_compute_stream:
+            options["user_compute_stream"] = str(user_compute_stream)
+
         return options
 
 
@@ -188,10 +191,11 @@ class OrtUnet(sd_unet.SdUnet):
         self.last_half_batch_size = None
         self.is_static_input_shape = True
 
-        self.last_cuda_stream = None
-        
         self.batch_size = 1
         self.use_cfg1_opt = True
+
+        # torch.cuda.current_stream().cuda_stream is always 0, we may remove the support of user compute stream later.
+        self.use_user_compute_stream = version.parse(ort.__version__) >= version.parse("1.18.0")
 
         self.verbose = False
         if self.verbose:
@@ -219,7 +223,7 @@ class OrtUnet(sd_unet.SdUnet):
 
         is_shape_changed = input_shape != self.last_input_shape and self.last_input_shape is not None
         is_half_changed = half_batch_size != self.last_half_batch_size and self.last_half_batch_size is not None
-        
+
         if (
             self.session is None
             or is_static != self.is_static_input_shape
@@ -232,7 +236,9 @@ class OrtUnet(sd_unet.SdUnet):
                     Disable `ORT Static Dimensions` from Settings if you expect to change image size/batch size frequently"
                 )
             self.create_session()
-        elif torch.cuda.current_stream().cuda_stream != self.last_cuda_stream:
+        elif (
+            self.use_user_compute_stream and torch.cuda.current_stream().cuda_stream != self.session.user_compute_stream
+        ):
             gr.Info("Cuda stream changed, restarting ORT inference session, first job may be slow.")
             print("cuda stream changed, restarting session")
             self.create_session()
@@ -264,20 +270,22 @@ class OrtUnet(sd_unet.SdUnet):
         return self.session.infer(inputs, half_batch_size)
 
     def create_session(self):
+        user_compute_stream = torch.cuda.current_stream().cuda_stream if self.use_user_compute_stream else 0
         if self.verbose:
-            print("create_session is called")
-            print("devices.device", devices.device)
+            print(
+                f"create_session is called. devices.device={devices.device} torch.cuda.current_stream().cuda_stream={torch.cuda.current_stream().cuda_stream} user_compute_stream={user_compute_stream}"
+            )
 
         device_id = torch.cuda.current_device()
         enable_cuda_graph = shared.opts.data.get("ort_static_dims", False)
         providers = [
             (
                 "CUDAExecutionProvider",
-                CudaSession.get_cuda_provider_options(device_id, enable_cuda_graph, use_user_compute_stream=True),
+                CudaSession.get_cuda_provider_options(device_id, enable_cuda_graph, user_compute_stream),
             ),
             "CPUExecutionProvider",
         ]
-        
+
         if self.verbose:
             print(providers)
 
@@ -295,13 +303,12 @@ class OrtUnet(sd_unet.SdUnet):
         device = torch.device("cuda", device_id)
         if self.session is not None:
             del self.session
-        self.session = CudaSession(session, device, enable_cuda_graph)
+
+        self.session = CudaSession(session, device, enable_cuda_graph, user_compute_stream)
 
         self.last_input_shape = None
         self.is_static_input_shape = enable_cuda_graph
 
-        self.last_cuda_stream = torch.cuda.current_stream().cuda_stream
-        
     def forward(
         self,
         x: torch.Tensor,
