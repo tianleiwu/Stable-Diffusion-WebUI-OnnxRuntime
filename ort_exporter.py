@@ -1,3 +1,8 @@
+# -------------------------------------------------------------------------
+# Copyright (c) Microsoft Corporation.  All rights reserved.
+# Licensed under the MIT License.
+# --------------------------------------------------------------------------
+
 import gc
 import os
 import shutil
@@ -39,21 +44,29 @@ def check_model_uses_external_data(onnx_model: onnx.ModelProto) -> bool:
 
 @swap_sdpa
 def export_onnx(
+    temp_dir: str,
     onnx_path: str,
     modelobj: UNetModel,
     profile: ProfileSettings,
     opset: int = 17,
     shape_inference: bool = False,
+    force_export: bool = False,
 ):
     if os.path.exists(onnx_path):
-        logger.info("Skip exporting to ONNX since %s exists.", onnx_path)
-        onnx_model = onnx.load(onnx_path, load_external_data=False)
-        modelobj.use_external_data = check_model_uses_external_data(onnx_model)
-        del onnx_model
-        return
+        if not force_export:
+            logger.info("Skip exporting to ONNX since %s exists.", onnx_path)
+            onnx_model = onnx.load(onnx_path, load_external_data=False)
+            modelobj.use_external_data = check_model_uses_external_data(onnx_model)
+            del onnx_model
+            return
+        else:
+            os.remove(onnx_path)
+            if os.path.exists(onnx_path + ".data"):
+                os.remove(onnx_path + ".data")
 
     s = time.time()
 
+    print("-" * 40)
     print("Exporting to ONNX...")
     inputs = modelobj.get_sample_input(
         profile.bs_opt * 2,
@@ -64,10 +77,8 @@ def export_onnx(
 
     model = modelobj.unet
     path = Path(onnx_path)
-    tmp_dir = os.path.abspath("onnx_export_tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-
-    tmp_path = os.path.join(tmp_dir, "model.onnx")
+    os.makedirs(temp_dir, exist_ok=True)
+    tmp_path = os.path.join(temp_dir, "model.onnx")
 
     try:
         logger.info("Exporting ONNX to %s", tmp_path)
@@ -84,14 +95,14 @@ def export_onnx(
                 dynamic_axes=modelobj.get_dynamic_axes(),
             )
     except Exception as e:
-        print(f"Exporting to ONNX failed. {e}")
+        logger.exception(e)
         return
 
     os.makedirs(path.parent, exist_ok=True)
     onnx_model = onnx.load(tmp_path, load_external_data=False)
     if modelobj.use_external_data or check_model_uses_external_data(onnx_model):
         if shape_inference:
-            shape_onnx_path = os.path.join(tmp_dir, "model_with_shape.onnx")
+            shape_onnx_path = os.path.join(temp_dir, "model_with_shape.onnx")
             logger.info(
                 "Running shape inference and save onnx to a temporary file %s",
                 shape_onnx_path,
@@ -119,23 +130,24 @@ def export_onnx(
 
     e = time.time()
     print(f"Exported ONNX {path} in {int(e-s)} seconds")
+    print("-" * 40)
 
-    shutil.rmtree(tmp_dir)
+    # shutil.rmtree(temp_dir)
     del onnx_model
 
 
 def optimize_onnx(
+    temp_dir: str,
     optimized_onnx_path: str,
     input_onnx_path: str,
     use_fp16: bool,
     model_type: str = "unet",
     use_external_data: bool = False,
+    force_optimize: bool = False,
 ):
-    print("Optimizing ONNX...")
-
-    tmp_dir = os.path.abspath("onnx_opt_tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-    logger.debug(tmp_dir)
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir, exist_ok=True)
 
     s = time.time()
     optimizer = OrtStableDiffusionOptimizer(model_type)
@@ -147,7 +159,7 @@ def optimize_onnx(
             optimizer.optimize(
                 input_onnx_path,
                 optimized_onnx_path,
-                tmp_dir,
+                tmp_dir=temp_dir,
                 float16=use_fp16,
                 keep_io_types=True,
                 fp32_op_list=None,
@@ -157,7 +169,7 @@ def optimize_onnx(
             )
         else:
             fusion_onnx_path = input_onnx_path[:-5] + "_fusion.onnx"
-            if os.path.exists(fusion_onnx_path):
+            if os.path.exists(fusion_onnx_path) and not force_optimize:
                 print("skip fusion since path exists", fusion_onnx_path)
             else:
                 optimizer.optimize_step1(
@@ -187,9 +199,11 @@ def optimize_onnx(
 
         e = time.time()
         print(f"Optimized onnx {optimized_onnx_path} in {int(e-s)} seconds")
+        print("-" * 40)
+
+        shutil.rmtree(temp_dir)
     except Exception as e:
-        print(f"Optimizing ONNX failed. {e}")
+        logger.exception(e)
         is_ok = False
 
-    shutil.rmtree(tmp_dir)
-    return is_ok
+    return is_ok, optimizer.weight_packing_list

@@ -3,6 +3,8 @@
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
 
+import json
+import logging
 import os
 import re
 from collections import OrderedDict
@@ -17,8 +19,11 @@ from onnxruntime.transformers.io_binding_helper import TypeHelper
 from packaging import version
 
 import ui_ort
+from ort_lora import apply_loras
 from ort_model_config import ModelType
 from ort_model_manager import ORT_MODEL_DIR, modelmanager
+
+logger = logging.getLogger(__name__)
 
 
 class OrtUnetOption(sd_unet.SdUnetOption):
@@ -181,7 +186,19 @@ class OrtUnet(sd_unet.SdUnet):
         super().__init__(*args, **kwargs)
 
         self.model_name = model_name
-        self.configs = configs
+        self.configs = configs        
+
+        self.batch_size = 1
+        self.use_cfg1_opt = True
+
+        # torch.cuda.current_stream().cuda_stream is always 0, we may remove the support of user compute stream later.
+        self.use_user_compute_stream = version.parse(ort.__version__) >= version.parse("1.18.0")
+
+        logger.debug("OrtUnet model_name: %s, profiles:%s", model_name, configs)
+
+        self.reset()
+        
+    def reset(self):
         self.profile_idx = 0
 
         self.session = None
@@ -190,23 +207,12 @@ class OrtUnet(sd_unet.SdUnet):
         self.last_input_shape = None
         self.last_half_batch_size = None
         self.is_static_input_shape = True
-
-        self.batch_size = 1
-        self.use_cfg1_opt = True
-
-        # torch.cuda.current_stream().cuda_stream is always 0, we may remove the support of user compute stream later.
-        self.use_user_compute_stream = version.parse(ort.__version__) >= version.parse("1.18.0")
-
-        self.verbose = False
-        if self.verbose:
-            print("OrtUnet model_name:", model_name, "profiles:", configs)
-
+        self.refitted_keys = set()
+        self.lora_refit_dict = {}
+        self.ort_initializers = []
+        
     def get_onnx_path(self):
-        if self.verbose:
-            print(
-                "get_onnx_path from configs with profile_idx={self.profile_idx}",
-                self.configs,
-            )
+        logger.debug("get_onnx_path from configs with profile_idx: %d, configs:%s", self.profile_idx, self.configs)
         assert len(self.configs) > 0
         assert self.profile_idx < len(self.configs)
         return os.path.join(ORT_MODEL_DIR, self.configs[self.profile_idx]["filepath"])
@@ -243,8 +249,7 @@ class OrtUnet(sd_unet.SdUnet):
             print("cuda stream changed, restarting session")
             self.create_session()
         elif is_shape_changed or is_half_changed:
-            if self.verbose:
-                print("reset_io_binding")
+            logger.debug("reset_io_binding")
             self.session.reset_io_binding()
 
         if input_shape != self.last_input_shape or is_half_changed:
@@ -261,8 +266,7 @@ class OrtUnet(sd_unet.SdUnet):
 
             self.session.allocate_buffers(shape_dict, half_batch_size)
 
-            if self.verbose:
-                print(shape_dict)
+            logger.debug("shape_dict=%s", shape_dict)
 
         inputs = {}
         for name, tensor in feed_dict.items():
@@ -271,10 +275,16 @@ class OrtUnet(sd_unet.SdUnet):
 
     def create_session(self):
         user_compute_stream = torch.cuda.current_stream().cuda_stream if self.use_user_compute_stream else 0
-        if self.verbose:
-            print(
-                f"create_session is called. devices.device={devices.device} torch.cuda.current_stream().cuda_stream={torch.cuda.current_stream().cuda_stream} user_compute_stream={user_compute_stream}"
-            )
+
+        logger.debug(
+            "create_session is called. devices.device=%s torch.cuda.current_stream().cuda_stream=%d user_compute_stream=%d",
+            devices.device,
+            torch.cuda.current_stream().cuda_stream,
+            user_compute_stream,
+        )
+        
+        import traceback
+        traceback.print_stack()
 
         device_id = torch.cuda.current_device()
         enable_cuda_graph = shared.opts.data.get("ort_static_dims", False)
@@ -286,18 +296,29 @@ class OrtUnet(sd_unet.SdUnet):
             "CPUExecutionProvider",
         ]
 
-        if self.verbose:
-            print(providers)
+        logger.debug("providers=%s", providers)
 
         # Session Options
         self.sess_options = ort.SessionOptions()
         ort.set_default_logger_severity(3)
+
+        self.refitted_keys = set(self.lora_refit_dict.keys())
+        logger.debug("lora weights=%s", self.refitted_keys)
+        if self.lora_refit_dict:
+            for key, tensor in self.lora_refit_dict.items():
+                logger.debug("key=%s tensor.device=%s", key, tensor.device)
+                ortvalue_initializer = ort.OrtValue.ortvalue_from_numpy(tensor.cpu().numpy())
+                self.ort_initializers.append(ortvalue_initializer)
+                self.sess_options.add_initializer(key, ortvalue_initializer)
+        else:
+            self.ort_initializers = []
+            
         # When the model has been optimized by onnxruntime, we can disable optimization to save session creation time.
         self.sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
 
         onnx_path = self.get_onnx_path()
-        if self.verbose:
-            print("create session for", onnx_path, "with providers=", providers)
+
+        logger.debug("create session for %s with providers=%s", onnx_path, providers)
 
         session = ort.InferenceSession(onnx_path, providers=providers, sess_options=self.sess_options)
         device = torch.device("cuda", device_id)
@@ -330,26 +351,40 @@ class OrtUnet(sd_unet.SdUnet):
         out = outputs[self.session.output_names[0]]
         return out
 
+    def apply_loras(self, refit_dict: Dict):
+        logger.debug("apply_loras is called, refit_dict is %s empty", "not" if refit_dict else "")
+        # if not self.refitted_keys.issubset(set(refit_dict.keys())):
+        #     # Need to ensure that weights that have been modified before and are not present anymore are reset.
+        #     self.refitted_keys = set()
+        #     self.deactivate()
+        self.lora_refit_dict = refit_dict
+        self.create_session()
+
     def switch_engine(self):
-        if self.verbose:
-            print("switch_engine is called")
+        logger.debug("switch_engine is called")
+
+        import traceback
+        traceback.print_stack()
 
         self.create_session()
 
     def activate(self):
-        if self.verbose:
-            print("activate is called")
-
+        logger.debug("activate is called, refit_dict is %s empty", "not" if self.lora_refit_dict else "")
+        import traceback
+        traceback.print_stack()
+       
         if self.session is None:
             self.create_session()
 
     def deactivate(self):
-        if self.verbose:
-            print("deactivate is called")
+        logger.debug("deactivate is called")
 
+        import traceback
+        traceback.print_stack()
+        
         if self.session is not None:
             del self.session
-            self.session = None
+            self.reset()
 
         devices.torch_gc()
 
@@ -364,7 +399,10 @@ class OnnxRuntimeScript(scripts.Script):
         self.idx = None
         self.hr_idx = None
         self.torch_unet = False
-        self.verbose = False
+
+        self.lora_hash = ""
+        self.update_lora = False
+        self.lora_refit_dict = {}
 
     def title(self):
         return "OnnxRuntime"
@@ -376,12 +414,13 @@ class OnnxRuntimeScript(scripts.Script):
         return super().setup(p, *args)
 
     def before_process(self, p, *args):  # 1
-        # Check divisibilty
+        # Check divisibility
         if p.width % 64 or p.height % 64:
             gr.Error("Target resolution must be divisible by 64 in both dimensions.")
 
         if self.is_img2img:
             return
+
         if p.enable_hr:
             hr_w = int(p.width * p.hr_scale)
             hr_h = int(p.height * p.hr_scale)
@@ -397,6 +436,7 @@ class OnnxRuntimeScript(scripts.Script):
             hr_scale = 1
         else:
             hr_scale = p.hr_scale if p.enable_hr else 1
+
         (
             valid_models,
             distances,
@@ -448,17 +488,56 @@ class OnnxRuntimeScript(scripts.Script):
         return best, best_hr
 
     def get_loras(self, p):
-        if self.verbose:
-            print("get_loras is called")
+        logger.debug("get_loras is called")
+
+        lora_pathes = []
+        lora_scales = []
 
         # get lora from prompt
         _prompt = p.prompt
         extra_networks = re.findall(r"\<(.*?)\>", _prompt)
         loras = [net for net in extra_networks if net.startswith("lora")]
 
-        if loras:
-            print("Onnxruntime extension does not support LoRA. Falling back to torch.")
-            self.torch_unet = True
+        # Avoid that extra networks will be loaded
+        for lora in loras:
+            _prompt = _prompt.replace(f"<{lora}>", "")
+        p.prompt = _prompt
+
+        # check if lora config has changes
+        if self.lora_hash != "".join(loras):
+            self.lora_hash = "".join(loras)
+            self.update_lora = True
+            if self.lora_hash == "":
+                self.lora_refit_dict = {}
+                return
+        else:
+            return
+
+        # Get pathes
+        print("Apllying LoRAs: " + str(loras))
+        available = modelmanager.available_loras()
+        for lora in loras:
+            lora_name, lora_scale = lora.split(":")[1:]
+            lora_scales.append(float(lora_scale))
+            if lora_name not in available:
+                raise Exception(f"Please export the LoRA checkpoint {lora_name} first from the OnnxRuntime LoRA tab")
+            lora_pathes.append(available[lora_name])
+
+        # Merge lora refit dicts
+        assert p.sd_model_hash == shared.sd_model.sd_checkpoint_info.shorthash
+        _, onnx_opt_path = modelmanager.get_engine_path(p.sd_model_name, p.sd_model_hash, provider=None)
+        packing_source_tensors_path = modelmanager.get_packing_source_tensors_path(
+            p.sd_model_name, p.sd_model_hash, provider=None
+        )
+
+        weight_map_path = onnx_opt_path[:-5] + ".weights_map.json"
+        with open(weight_map_path) as fp_weight_map:
+            weight_map = json.load(fp_weight_map)
+            weight_packing_list = weight_map["weight_packing"]
+
+        self.lora_refit_dict = apply_loras(
+            onnx_opt_path, packing_source_tensors_path, weight_packing_list, lora_pathes, lora_scales
+        )
 
     def process(self, p, *args):
         # before unet_init
@@ -468,10 +547,17 @@ class OnnxRuntimeScript(scripts.Script):
 
         model_name = p.sd_model_name
 
-        if self.verbose:
-            print(
-                f"process sd_unet_option.model_name={sd_unet_option.model_name} p.sd_model_name={p.sd_model_name} p.sd_model_hash={p.sd_model_hash} sd_vae_name={p.sd_vae_name} sd_vae_hash={p.sd_vae_hash} cfg_scale={p.cfg_scale} refiner_checkpoint={p.refiner_checkpoint} args={args}"
-            )
+        logger.debug(
+            "process sd_unet_option.model_name=%s p.sd_model_name=%s p.sd_model_hash=%s sd_vae_name=%s sd_vae_hash=%s cfg_scale=%s refiner_checkpoint=%s args=%s",
+            sd_unet_option.model_name,
+            p.sd_model_name,
+            p.sd_model_hash,
+            p.sd_vae_name,
+            p.sd_vae_hash,
+            p.cfg_scale,
+            p.refiner_checkpoint,
+            args,
+        )
 
         if sd_unet_option.model_name != model_name:
             if p.sd_model_hash == shared.sd_model.sd_checkpoint_info.shorthash:
@@ -488,8 +574,7 @@ class OnnxRuntimeScript(scripts.Script):
         self.idx, self.hr_idx = self.get_profile_idx(p, model_name, ModelType.UNET)
         self.torch_unet = self.idx is None or self.hr_idx is None
 
-        if self.verbose:
-            print(f"idx={self.idx} hr_idx={self.hr_idx} torch_unet={self.torch_unet}")
+        logger.debug("idx=%d hr_idx=%d torch_unet=%s", self.idx, self.hr_idx, self.torch_unet)
 
         if not self.torch_unet:
             self.get_loras(p)
@@ -497,8 +582,7 @@ class OnnxRuntimeScript(scripts.Script):
         self.apply_unet(sd_unet_option)
 
     def apply_unet(self, sd_unet_option):
-        if self.verbose:
-            print("apply_unet is called")
+        logger.debug("apply_unet is called")
         if sd_unet_option == sd_unet.current_unet_option and sd_unet.current_unet is not None and not self.torch_unet:
             return
 
@@ -515,20 +599,21 @@ class OnnxRuntimeScript(scripts.Script):
         else:
             shared.sd_model.model.diffusion_model.to(devices.cpu)
             devices.torch_gc()
+            if self.lora_refit_dict:
+                self.update_lora = True
 
         sd_unet.current_unet = sd_unet_option.create_unet()
         sd_unet.current_unet.profile_idx = self.idx
         sd_unet.current_unet.option = sd_unet_option
-        sd_unet.current_unet_option = sd_unet_option
+        sd_unet.current_unet.lora_refit_dict = self.lora_refit_dict
 
-        print(f"Activating unet: {sd_unet.current_unet.option.label}")
+        logger.info(f"Activating unet: {sd_unet.current_unet.option.label}")
         sd_unet.current_unet.activate()
 
     def process_batch(self, p, *args, **kwargs):
-        if self.verbose:
-            print(
-                f"process_batch is called. batch_size={p.batch_size} w={p.width} height={p.height} steps={p.steps} cfg_scale={p.cfg_scale} sd_model_name={p.sd_model_name} args={args} kwargs={kwargs}"
-            )
+        logger.debug(
+            f"process_batch is called. batch_size={p.batch_size} w={p.width} height={p.height} steps={p.steps} cfg_scale={p.cfg_scale} sd_model_name={p.sd_model_name} args={args} kwargs={kwargs}"
+        )
 
         if self.torch_unet or sd_unet.current_unet is None:
             return super().process_batch(p, *args, **kwargs)
@@ -541,8 +626,7 @@ class OnnxRuntimeScript(scripts.Script):
             sd_unet.current_unet.start_batch(p.batch_size, p.width, p.height, p.cfg_scale)
 
     def before_hr(self, p, *args):
-        if self.verbose:
-            print("before_hr is called. p.sd_model_name={p.sd_model_name} cfg_scale={p.cfg_scale} args={args}")
+        logger.debug("before_hr is called. p.sd_model_name=%s cfg_scale=%s args=%s", p.sd_model_name, p.cfg_scale, args)
 
         if self.idx != self.hr_idx:
             sd_unet.current_unet.profile_idx = self.hr_idx
@@ -551,8 +635,13 @@ class OnnxRuntimeScript(scripts.Script):
         return super().before_hr(p, *args)
 
     def after_extra_networks_activate(self, p, *args, **kwargs):
-        if self.verbose:
-            print(f"after_extra_networks_activate is called, torch_unet={self.torch_unet} args={args} kwargs={kwargs}")
+        logger.debug(
+            "after_extra_networks_activate is called, torch_unet=%s args=%s kwargs=%s", self.torch_unet, args, kwargs
+        )
+
+        if self.update_lora and not self.torch_unet:
+            self.update_lora = False
+            sd_unet.current_unet.apply_loras(self.lora_refit_dict)
 
 
 def list_unets(l):

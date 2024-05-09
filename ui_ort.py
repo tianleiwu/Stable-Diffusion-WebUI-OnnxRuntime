@@ -13,17 +13,17 @@ import torch
 from modules import sd_hijack, shared
 from modules.ui_common import refresh_symbol
 from modules.ui_components import FormRow, ToolButton
+from safetensors.torch import save_file
 
 from ort_exporter import export_onnx, optimize_onnx
-from ort_model_config import ProfilePrests
+from ort_lora import export_lora, export_weights_map, get_lora_checkpoints, save_packing_source_tensors
+from ort_model_config import ProfilePrests, SDVersion
 from ort_model_helper import UNetModel
-from ort_model_manager import cc_major, cc_minor, modelmanager
+from ort_model_manager import ONNX_MODEL_DIR, ORT_MODEL_DIR, cc_major, cc_minor, modelmanager
 
 logger = logging.getLogger(__name__)
 
 profile_presets = ProfilePrests()
-
-logging.basicConfig(level=logging.INFO)
 
 
 def get_context_dim():
@@ -43,11 +43,8 @@ def is_fp32():
     return use_fp32
 
 
-def export_unet_to_ort(force_export):
+def export_unet_to_ort(force_export, force_optimize):
     sd_hijack.model_hijack.apply_optimizations("None")
-
-    logging.basicConfig(level=logging.INFO)
-
     is_xl = shared.sd_model.is_sdxl
     info = shared.sd_model.sd_checkpoint_info
 
@@ -65,28 +62,35 @@ def export_unet_to_ort(force_export):
     profile_settings.token_to_dim()
     print(f"Exporting checkpoint {info.short_title} to OnnxRuntime using profile setting: {profile_settings}")
 
-    onnx_filename, onnx_path = modelmanager.get_onnx_path(model_name, model_hash)
+    onnx_path = modelmanager.get_onnx_path(model_name, model_hash)
     embedding_dim = get_context_dim()
 
-    modelobj = UNetModel(
+    unet_model = UNetModel(
         shared.sd_model.model.diffusion_model,
         embedding_dim,
         is_xl=is_xl,
     )
-    modelobj.apply_torch_model()
+    unet_model.apply_torch_model()
+
+    temp_dir = os.path.join(ONNX_MODEL_DIR, "temp_export")
 
     export_onnx(
+        temp_dir,
         onnx_path,
-        modelobj,
+        unet_model,
         profile_settings,
+        force_export=force_export,
     )
     gc.collect()
     torch.cuda.empty_cache()
 
-    ort_engine_filename, ort_engine_path = modelmanager.get_engine_path(model_name, model_hash)
+    ort_engine_filename, ort_engine_path = modelmanager.get_engine_path(model_name, model_hash, provider=None)
+    weight_map_path = modelmanager.get_weights_map_path(model_name, model_hash, provider=None)
+    # weight_packing_path = modelmanager.get_weights_packing_path(model_name, model_hash, provider=None)
+    packing_source_tensors_path = modelmanager.get_packing_source_tensors_path(model_name, model_hash, provider=None)
 
-    if not os.path.exists(ort_engine_path) or force_export:
-        print("Optimize ONNX for OnnxRuntime... This can take a while, please check the progress in the terminal.")
+    if not (os.path.exists(ort_engine_path) and os.path.exists(weight_map_path)) or force_optimize:
+        print("Optimize ONNX for OnnxRuntime... This can take a while.")
         gr.Info("Optimize ONNX for OnnxRuntime... This can take a while, please check the progress in the terminal.")
 
         # Unload model to CPU to free GPU memory so that ORT has enough memory to create session in GPU.
@@ -96,12 +100,20 @@ def export_unet_to_ort(force_export):
             model = shared.sd_model.cpu()
             torch.cuda.empty_cache()
 
-        is_ok = optimize_onnx(
+        temp_dir = os.path.join(ONNX_MODEL_DIR, "temp_optimize")
+        is_ok, weight_packing_list = optimize_onnx(
+            temp_dir,
             ort_engine_path,
             onnx_path,
             use_fp16=not use_fp32,
-            use_external_data=modelobj.use_external_data,
+            use_external_data=unet_model.use_external_data,
+            force_optimize=force_optimize,
         )
+
+        # Save the weight packing list for LoRA weight refitting later.
+        # with open(weight_packing_path, "w") as fp:
+        #     json.dump(weight_packing_list, fp)
+        #     print(f"Saved weight packing list to {weight_packing_path}")
 
         if need_unload_model_to_cpu:
             shared.sd_model = model.cuda()
@@ -113,16 +125,38 @@ def export_unet_to_ort(force_export):
             "OnnxRuntime engine found. Skipping build. You can enable Force Export in the Advanced Settings to force a rebuild if needed."
         )
 
+        # with open(weight_packing_path) as fp_weight_packing:
+        #     print(f"[I] Loading weight packing: {weight_packing_path} ")
+        #     weight_packing_list = json.load(fp_weight_packing)
+
+    if os.path.exists(packing_source_tensors_path):
+        os.remove(packing_source_tensors_path)
+    logger.info("export packing source tensors from onnx %s to %s", onnx_path, packing_source_tensors_path)
+    save_packing_source_tensors(weight_packing_list, onnx_path, packing_source_tensors_path)
+
+    if os.path.exists(weight_map_path):
+        os.remove(weight_map_path)
+    logger.info("export weights map from onnx %s to %s", ort_engine_path, weight_map_path)
+    export_weights_map(unet_model, ort_engine_path, weight_map_path, weight_packing_list)
+
+    # Export raw weights map for testing
+    # raw_weight_map_path = modelmanager.get_weights_map_path(model_name, model_hash, provider="raw")
+    # if os.path.exists(raw_weight_map_path):
+    #     os.remove(raw_weight_map_path)
+    # if not os.path.exists(raw_weight_map_path):
+    #     logger.info("export raw weights map from onnx %s to %s", onnx_path, raw_weight_map_path)
+    #     export_weights_map(unet_model, onnx_path, raw_weight_map_path, [])
+
     # Allow it to add to JSON for recovering json file.
-    profile = modelobj.get_input_profile(profile_settings)
+    profile = unet_model.get_input_profile(profile_settings)
 
     modelmanager.add_entry(
         info.model_name,  # pass the full model name to match in "Automatic": https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/cf2772fab0af5573da775e7437e6acdca424f26e/modules/sd_unet.py#L24
         ort_engine_filename,
         profile,
         fp32=use_fp32,
-        inpaint=modelobj.in_channels == 6,
-        unet_hidden_dim=modelobj.in_channels,
+        inpaint=unet_model.in_channels == 6,
+        unet_hidden_dim=unet_model.in_channels,
     )
 
     gc.collect()
@@ -198,28 +232,175 @@ def engine_profile_card():
     return model_md
 
 
+# LoRA
+def export_lora_to_ort(lora_name, force_export):
+    logger.debug("export_lora_to_ort is called. lora_name=%s, force_export=%s", lora_name, force_export)
+    if isinstance(lora_name, list):
+        return "## Please select only one Lora to export"
+
+    is_xl = shared.sd_model.is_sdxl
+    available_lora_models = get_lora_checkpoints()
+
+    lora_name = lora_name.split(" ")[0]
+    lora_model = available_lora_models.get(lora_name, None)
+    logger.debug("lora_name=%s, lora_model=%s", lora_name, lora_model)
+
+    if lora_model is None:
+        return f"## No LoRA model found for {lora_name}"
+
+    version = lora_model.get("version", SDVersion.Unknown)
+    if version == SDVersion.Unknown:
+        logger.info("LoRA SD version couldn't be determined. Please ensure the correct SD Checkpoint is selected.")
+
+    model_name = shared.sd_model.sd_checkpoint_info.name_for_extra
+    model_hash = shared.sd_model.sd_checkpoint_info.shorthash
+    logger.debug("model_name=%s, model_hash=%s", model_name, model_hash)
+
+    if not version.match(shared.sd_model):
+        print(
+            f"""LoRA SD version ({version}) does not match the current SD version ({model_name}). Please ensure the correct SD Checkpoint is selected."""
+        )
+
+    profile_settings = profile_presets.get_default(is_xl=is_xl)
+    logger.info("Exporting %s to OnnxRuntime using - %s", lora_name, profile_settings)
+    profile_settings.token_to_dim()
+
+    # raw_onnx_path = modelmanager.get_onnx_path(model_name, model_hash)
+
+    _, onnx_opt_path = modelmanager.get_engine_path(model_name, model_hash)
+    if not os.path.exists(onnx_opt_path):
+        return f"## Please export the base model ({model_name} [{model_hash}]) first."
+
+    embedding_dim = get_context_dim()
+
+    unet_model = UNetModel(
+        shared.sd_model.model.diffusion_model,
+        embedding_dim,
+        is_xl=is_xl,
+    )
+    unet_model.apply_torch_model()
+
+    weights_map_path = modelmanager.get_weights_map_path(model_name, model_hash, provider=None)
+    if not os.path.exists(weights_map_path):
+        logger.info("export weights map from onnx %s to %s", onnx_opt_path, weights_map_path)
+        export_weights_map(onnx_opt_path, weights_map_path)
+
+    # Export raw weights map for comparison
+    # raw_weights_map_path = modelmanager.get_weights_map_path(model_name, model_hash, provider="raw")
+    # if not os.path.exists(raw_weights_map_path):
+    #     logger.info("export raw weights map from onnx %s to %s", raw_onnx_path, weights_map_path)
+    #     export_weights_map(raw_onnx_path, raw_weights_map_path)
+
+    lora_ort_name = f"{lora_name}.lora"
+    lora_ort_path = os.path.join(ORT_MODEL_DIR, lora_ort_name)
+
+    if os.path.exists(lora_ort_path) and not force_export:
+        logger.info(
+            "File found: %s. Skipping build. You can enable Force Export in the Advanced Settings to force a rebuild if needed.",
+            lora_ort_path,
+        )
+        return "## Exported Successfully \n"
+
+    delta_dict = export_lora(
+        unet_model,
+        onnx_opt_path,
+        weights_map_path,
+        packing_source_tensors_path=modelmanager.get_packing_source_tensors_path(model_name, model_hash, provider=None),
+        lora_name=lora_model["filename"],
+        profile=profile_settings,
+    )
+
+    save_file(delta_dict, lora_ort_path)
+
+    return "## Exported Successfully \n"
+
+
+def get_valid_lora_checkpoints():
+    available_lora_models = get_lora_checkpoints()
+    return [f"{k} ({v['version']})" for k, v in available_lora_models.items()]
+
+
+def disable_lora_export(lora):
+    if lora is None:
+        return gr.update(visible=False)
+    else:
+        return gr.update(visible=True)
+
+
 def on_ui_tabs():
     with gr.Blocks(analytics_enabled=False) as ort_interface:
         with gr.Row(equal_height=True):
-            with gr.Column(variant="panel"), gr.Tabs(elem_id="ort_tabs"):
-                with gr.Tab(label="OnnxRuntime Exporter"):
-                    gr.Markdown(
-                        value="# Build ONNX model for CUDA",
-                    )
-
-                    with FormRow(elem_classes="checkboxes-row", variant="compact"):
-                        force_rebuild = gr.Checkbox(
-                            label="Force Rebuild.",
-                            value=False,
-                            elem_id="ort_force_rebuild",
+            with gr.Column(variant="panel"):
+                with gr.Tabs(elem_id="ort_tabs"):
+                    with gr.Tab(label="OnnxRuntime Exporter"):
+                        gr.Markdown(
+                            value="# Build ONNX model for CUDA",
                         )
 
-                    button_export_default_unet = gr.Button(
-                        value="Export and Optimize ONNX",
-                        variant="primary",
-                        elem_id="ort_export_default_unet",
-                        visible=True,
-                    )
+                        with FormRow(elem_classes="checkboxes-row-1", variant="compact"):
+                            force_export = gr.Checkbox(
+                                label="Force Export",
+                                value=False,
+                                elem_id="ort_force_export",
+                            )
+                        with FormRow(elem_classes="checkboxes-row-2", variant="compact"):
+                            force_optimize = gr.Checkbox(
+                                label="Force Optimize",
+                                value=False,
+                                elem_id="ort_force_optimize",
+                            )
+                        button_export_default_unet = gr.Button(
+                            value="Export and Optimize ONNX",
+                            variant="primary",
+                            elem_id="ort_export_default_unet",
+                            visible=True,
+                        )
+
+                    with gr.Tab(label="OnnxRuntime LoRA"):
+                        gr.Markdown("# Apply LoRA checkpoint to OnnxRuntime model")
+                        # lora_refresh_button = gr.Button(
+                        #     value="Refresh",
+                        #     variant="primary",
+                        #     elem_id="ort_lora_refresh",
+                        # )
+                        with FormRow(elem_classes="droplist-row", variant="compact"):
+                            ort_lora_dropdown = gr.Dropdown(
+                                choices=get_valid_lora_checkpoints(),
+                                elem_id="lora_model",
+                                label="LoRA Model",
+                                default=None,
+                                multiselect=False,
+                            )
+
+                            lora_refresh_button = ToolButton(
+                                value=refresh_symbol, elem_id="ort_lora_refresh", visible=True
+                            )
+
+                        with FormRow(elem_classes="checkboxes-row", variant="compact"):
+                            ort_lora_force_rebuild = gr.Checkbox(
+                                label="Force Rebuild.",
+                                value=False,
+                                elem_id="ort_lora_force_rebuild",
+                            )
+
+                        button_export_lora_unet = gr.Button(
+                            value="Convert to OnnxRuntime",
+                            variant="primary",
+                            elem_id="ort_lora_export_unet",
+                            visible=False,
+                        )
+
+                        lora_refresh_button.click(
+                            get_valid_lora_checkpoints,
+                            None,
+                            ort_lora_dropdown,
+                        )
+
+                        ort_lora_dropdown.change(
+                            disable_lora_export,
+                            ort_lora_dropdown,
+                            button_export_lora_unet,
+                        )
 
             with gr.Column(variant="panel"), open(
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "help.md"),
@@ -258,8 +439,15 @@ def on_ui_tabs():
         button_export_default_unet.click(
             export_unet_to_ort,
             inputs=[
-                force_rebuild,
+                force_export,
+                force_optimize,
             ],
+            outputs=[ort_result],
+        )
+
+        button_export_lora_unet.click(
+            export_lora_to_ort,
+            inputs=[ort_lora_dropdown, ort_lora_force_rebuild],
             outputs=[ort_result],
         )
 

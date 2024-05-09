@@ -7,9 +7,6 @@
 ONNX Model Optimizer for Stable Diffusion
 """
 
-# This file is modified from https://github.com/microsoft/onnxruntime/blob/main/onnxruntime/python/tools/transformers/models/stable_diffusion/ort_optimizer.py
-# We will remove this file once the change is in nightly or release package.
-
 import gc
 import logging
 from pathlib import Path
@@ -18,21 +15,21 @@ import onnx
 import psutil
 import torch
 from onnxruntime.transformers.fusion_options import FusionOptions
-from onnxruntime.transformers.onnx_model_unet import UnetOnnxModel
-from onnxruntime.transformers.onnx_model_vae import VaeOnnxModel
 from onnxruntime.transformers.optimizer import optimize_by_onnxruntime
+
+from unet_fusion_tracer import UnetFusionTracer
 
 logger = logging.getLogger(__name__)
 
 
 class OrtStableDiffusionOptimizer:
     def __init__(self, model_type: str = "unet"):
-        assert model_type in ["vae", "unet"]
+        assert model_type in ["unet"]
         self.model_type = model_type
         self.model_type_class_mapping = {
-            "unet": UnetOnnxModel,
-            "vae": VaeOnnxModel,
+            "unet": UnetFusionTracer,
         }
+        self.weight_packing_list = []
 
     def print_memory_usage(self, message):
         gb = float(1024**3)
@@ -57,12 +54,16 @@ class OrtStableDiffusionOptimizer:
         gc.collect()
 
         ort_optimized_model_path = Path(tmp_dir) / "optimized.onnx"
+
+        # Disable ConstantFolding to avoid folding the Transpose node and Conv weights, so that we can preserve the weights for LoRA refit.
         optimize_by_onnxruntime(
-            str(tmp_model_path),
+            onnx_model_path=str(tmp_model_path),
             use_gpu=True,
             optimized_model_path=str(ort_optimized_model_path),
             save_as_external_data=use_external_data_format,
             external_data_filename="optimized.onnx.data",
+            provider="cuda",
+            disabled_optimizers=["ConstantFolding"],
         )
         model = onnx.load(str(ort_optimized_model_path), load_external_data=True)
         return self.model_type_class_mapping[self.model_type](model)
@@ -92,8 +93,6 @@ class OrtStableDiffusionOptimizer:
         if optimize_by_fusion:
             fusion_options = FusionOptions(self.model_type)
 
-            # It is allowed float16=False and final_target_float16=True, for using fp32 as intermediate optimization step.
-            # For rare fp32 use case, we can disable packed kv/qkv since there is no fp32 TRT fused attention kernel.
             if self.model_type in ["unet"] and not final_target_float16:
                 fusion_options.enable_packed_kv = False
                 fusion_options.enable_packed_qkv = False
@@ -101,6 +100,9 @@ class OrtStableDiffusionOptimizer:
             m.optimize(fusion_options)
             m.topological_sort()
             m.model.producer_name = "onnxruntime.transformers"
+
+        if self.model_type == "unet":
+            self.weight_packing_list = m.weight_packing_list
 
         if keep_outputs:
             m.prune_graph(outputs=keep_outputs)
@@ -149,11 +151,15 @@ class OrtStableDiffusionOptimizer:
 
         # It is allowed float16=False and final_target_float16=True, for using fp32 as intermediate optimization step.
         # For rare fp32 use case, we can disable packed kv/qkv since there is no fp32 TRT fused attention kernel.
-        if self.model_type in ["unet"] and not final_target_float16:
+
+        # Disable packing for lora refit, or when optimized model is fp32
+        if (self.model_type in ["unet"] and not final_target_float16):
             fusion_options.enable_packed_kv = False
             fusion_options.enable_packed_qkv = False
 
         m.optimize(fusion_options)
+        self.weight_packing_list = m.weight_packing_list
+
         m.topological_sort()
         m.model.producer_name = "onnxruntime.transformers"
 
@@ -180,6 +186,8 @@ class OrtStableDiffusionOptimizer:
             optimized_model_path=str(optimized_onnx_path),
             save_as_external_data=use_external_data,
             external_data_filename=Path(optimized_onnx_path).name + "data",
+            disabled_optimizers=["ConstantFolding"],
+            provider="cuda",
         )
 
         logger.info(f"{self.model_type} is optimized: {optimized_onnx_path}")

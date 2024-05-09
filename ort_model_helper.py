@@ -32,14 +32,12 @@ class UNetModel(torch.nn.Module):
         self,
         unet,
         embedding_dim: int,
-        text_minlen: int = 77,
         is_xl: bool = False,
     ) -> None:
         super().__init__()
         self.unet = unet
         self.is_xl = is_xl
 
-        self.text_minlen = text_minlen
         self.embedding_dim = embedding_dim
 
         self.y_embed_dim = 2816

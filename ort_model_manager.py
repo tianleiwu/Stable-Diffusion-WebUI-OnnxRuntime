@@ -1,3 +1,23 @@
+# -------------------------------------------------------------------------
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License.
+# --------------------------------------------------------------------------
+#
+# SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 import copy
 import json
 import os
@@ -49,7 +69,7 @@ class ModelManager:
     def get_onnx_path(model_name, model_hash):
         onnx_filename = f"{model_name}_{model_hash}.onnx"
         onnx_path = os.path.join(ONNX_MODEL_DIR, onnx_filename)
-        return onnx_filename, onnx_path
+        return onnx_path
 
     def get_engine_path(self, model_name, model_hash, provider=None):
         if provider is None:
@@ -58,6 +78,21 @@ class ModelManager:
         engine_path = os.path.join(ORT_MODEL_DIR, engine_filename)
 
         return engine_filename, engine_path
+
+    def get_weights_map_path(self, model_name: str, model_hash: str, provider=None):
+        if provider is None:
+            provider = self.default_provider
+        return os.path.join(ORT_MODEL_DIR, f"{model_name}_{model_hash}_{provider}.weights_map.json")
+
+    def get_weights_packing_path(self, model_name: str, model_hash: str, provider=None):
+        if provider is None:
+            provider = self.default_provider
+        return os.path.join(ORT_MODEL_DIR, f"{model_name}_{model_hash}_{provider}.weight_pack.json")
+
+    def get_packing_source_tensors_path(self, model_name: str, model_hash: str, provider=None):
+        if provider is None:
+            provider = self.default_provider
+        return os.path.join(ORT_MODEL_DIR, f"{model_name}_{model_hash}_{provider}.packing.safetensors")
 
     def update(self):
         ort_engines = [ort_file for ort_file in os.listdir(ORT_MODEL_DIR) if ort_file.endswith(".onnx")]
@@ -143,14 +178,23 @@ class ModelManager:
         distances = []
         idx = []
         models = self.available_models()
-        for i, model in enumerate(models[base_model]):
-            valid, distance = model["config"].is_compatible(width, height, batch_size, max_embedding)
-            if valid:
-                valid_models.append(model)
-                distances.append(distance)
-                idx.append(i)
+        if base_model in models:
+            for i, model in enumerate(models[base_model]):
+                valid, distance = model["config"].is_compatible(width, height, batch_size, max_embedding)
+                if valid:
+                    valid_models.append(model)
+                    distances.append(distance)
+                    idx.append(i)
 
         return valid_models, distances, idx
 
+    def available_loras(self):
+        available = {}
+        for p in os.listdir(ORT_MODEL_DIR):
+            if not p.endswith(".lora"):
+                continue
+            available[os.path.splitext(p)[0]] = os.path.join(ORT_MODEL_DIR, p)
+        print("available_loras", available)
+        return available
 
 modelmanager = ModelManager()
